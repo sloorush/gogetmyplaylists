@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# But not these files
+!.gitignore
+!updateall.sh
+!playlists.json
+
+# Explicitly ignore (even if above rules change)
+.logs/
+*.sync.spotdl
