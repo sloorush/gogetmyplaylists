@@ -41,20 +41,17 @@ Auto-discovers your public Spotify playlists and downloads songs as 320kbps MP3s
 # Activate the venv first (if not already active)
 source .venv/bin/activate
 
-# Full sync: discover all playlists + download missing songs
+# Download missing songs from existing playlists.json
 python3 sync.py
+
+# Re-discover playlists from Spotify profile + download
+python3 sync.py --discover
 
 # Only update playlists.json (no downloads)
 python3 sync.py --discover-only
 
-# Only download from existing playlists.json (skip discovery)
-python3 sync.py --download-only
-
 # Sync a single playlist by folder name
 python3 sync.py --playlist boombap
-
-# Combine flags: download a single playlist without discovery
-python3 sync.py --download-only --playlist boombap
 
 # Preview what would be downloaded
 python3 sync.py --dry-run
@@ -70,16 +67,28 @@ python3 sync.py --add "https://open.spotify.com/playlist/37i9dQZF1DX5cZuAHLNjGz"
 
 # Add with a custom folder name
 python3 sync.py --add "https://open.spotify.com/playlist/37i9dQZF1DX5cZuAHLNjGz" --name punjabi101
+
+# Embed metadata into existing files (no re-download)
+python3 sync.py --tag-only
+python3 sync.py --tag-only --playlist boombap
+
+# Upgrade old 192kbps files to 320kbps (re-downloads them)
+python3 sync.py --upgrade --dry-run          # preview first
+python3 sync.py --upgrade --max-downloads 50 # spread across sessions
+
+# Only upgrade files at or below 192kbps (default threshold is 256)
+python3 sync.py --upgrade --upgrade-threshold 192
 ```
 
 ## How It Works
 
 1. **Authenticate** with Spotify via OAuth (scopes: `playlist-read-private`, `playlist-read-collaborative`)
-2. **Discover** your public, user-owned playlists (use `--add` for followed/editorial ones)
-3. **Merge** with existing `playlists.json`, preserving custom folder names
-4. **For each playlist**: fetch track metadata, compare against existing files, download missing tracks
-5. **Download** via yt-dlp: search YouTube for `"Artist - Song official audio"`, extract audio as 320kbps MP3
+2. **Load playlists** from `playlists.json` (or **discover** from Spotify profile with `--discover`)
+3. **For each playlist**: fetch track metadata, compare against existing files, download missing tracks
+4. **Download** via yt-dlp: search YouTube for `"Artist - Song official audio"`, extract audio as 320kbps MP3
+5. **Tag**: embed ID3 metadata (title, artist, album, track number, album art) from Spotify into each MP3
 6. **Rate limiting**: multi-layer protection (random delays, cookies, 429 backoff, session limits)
+7. **Upgrade** (`--upgrade`): scan existing files with ffprobe, delete low-bitrate ones, re-download at 320kbps
 
 ## Troubleshooting
 

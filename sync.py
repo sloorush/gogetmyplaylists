@@ -9,16 +9,19 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import random
 import unicodedata
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import yt_dlp
+from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TPE2, TALB, TRCK, TPOS, TDRC, TSRC, APIC
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -112,6 +115,61 @@ def existing_files_normalized(folder: Path) -> dict[str, str]:
             if f.suffix.lower() == ".mp3":
                 result[normalize_for_comparison(f.stem)] = f.name
     return result
+
+
+def get_bitrate(filepath: Path) -> int | None:
+    """Get the audio bitrate of an MP3 file in kbps using ffprobe. Returns None on error."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "a:0",
+             "-show_entries", "stream=bit_rate", "-of", "csv=p=0", str(filepath)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip()) // 1000
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return None
+
+
+def embed_metadata(filepath: Path, track: dict) -> bool:
+    """Embed ID3 metadata and album art into an MP3 file. Returns True on success."""
+    try:
+        try:
+            tags = ID3(filepath)
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        tags.add(TIT2(encoding=3, text=track["name"]))
+        tags.add(TPE1(encoding=3, text=", ".join(track["artists"])))
+        if track.get("album"):
+            tags.add(TALB(encoding=3, text=track["album"]))
+        if track.get("album_artist"):
+            tags.add(TPE2(encoding=3, text=track["album_artist"]))
+        if track.get("track_number"):
+            tags.add(TRCK(encoding=3, text=str(track["track_number"])))
+        if track.get("disc_number"):
+            tags.add(TPOS(encoding=3, text=str(track["disc_number"])))
+        if track.get("release_date"):
+            tags.add(TDRC(encoding=3, text=track["release_date"]))
+        if track.get("isrc"):
+            tags.add(TSRC(encoding=3, text=track["isrc"]))
+
+        # Download and embed album art
+        art_url = track.get("album_art_url")
+        if art_url:
+            try:
+                art_data = urllib.request.urlopen(art_url, timeout=10).read()
+                mime = "image/jpeg" if ".jpg" in art_url or ".jpeg" in art_url else "image/png"
+                tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=art_data))
+            except Exception as e:
+                logger.debug(f"  Could not download album art: {e}")
+
+        tags.save(filepath)
+        return True
+    except Exception as e:
+        logger.warning(f"  Failed to embed metadata in {filepath.name}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +283,22 @@ def get_playlist_tracks(sp: spotipy.Spotify, playlist_url: str) -> list[dict]:
             artists = [a["name"] for a in track.get("artists", []) if a.get("name")]
             if not artists:
                 continue
+            album = track.get("album", {})
+            album_artists = album.get("artists", [])
+            album_images = album.get("images", [])
             tracks.append({
                 "name": track["name"],
                 "artists": artists,
-                "album": track.get("album", {}).get("name", ""),
+                "album": album.get("name", ""),
                 "duration_ms": track.get("duration_ms", 0),
                 "spotify_url": track.get("external_urls", {}).get("spotify", ""),
+                "track_number": track.get("track_number"),
+                "disc_number": track.get("disc_number"),
+                "album_art_url": album_images[0].get("url") if album_images else None,
+                "release_date": album.get("release_date"),
+                "isrc": track.get("external_ids", {}).get("isrc"),
+                "explicit": track.get("explicit", False),
+                "album_artist": album_artists[0]["name"] if album_artists else None,
             })
         offset += len(batch["items"])
         if offset >= batch["total"]:
@@ -322,6 +390,15 @@ def download_track(
                         f"  Duration mismatch: YouTube={yt_duration:.0f}s vs Spotify={sp_duration:.0f}s "
                         f"for {track['name']}"
                     )
+
+        # Embed Spotify metadata into the downloaded MP3
+        mp3_path = Path(output_template + ".mp3")
+        if mp3_path.exists():
+            if embed_metadata(mp3_path, track):
+                logger.debug(f"  Metadata embedded: {mp3_path.name}")
+            else:
+                logger.debug(f"  Metadata embedding failed: {mp3_path.name}")
+
         return True
 
     except yt_dlp.utils.DownloadError as e:
@@ -364,6 +441,8 @@ def sync_playlist(
     dry_run: bool = False,
     max_downloads: int | None = None,
     download_count: list[int] | None = None,
+    upgrade: bool = False,
+    upgrade_threshold: int = 256,
 ) -> dict:
     """
     Sync a single playlist. Returns stats dict.
@@ -393,6 +472,25 @@ def sync_playlist(
 
     # Build map of existing files for fuzzy matching
     existing = existing_files_normalized(resolved)
+
+    # Upgrade: remove low-bitrate files so they get re-downloaded
+    if upgrade:
+        upgraded = 0
+        for norm_name, actual_name in list(existing.items()):
+            filepath = resolved / actual_name
+            bitrate = get_bitrate(filepath)
+            if bitrate is not None and bitrate <= upgrade_threshold:
+                if dry_run:
+                    logger.info(f"  [DRY RUN] Would upgrade ({bitrate}kbps): {actual_name}")
+                else:
+                    logger.info(f"  Removing low-bitrate file ({bitrate}kbps): {actual_name}")
+                    filepath.unlink()
+                del existing[norm_name]
+                upgraded += 1
+            elif bitrate is not None:
+                logger.debug(f"  OK ({bitrate}kbps): {actual_name}")
+        if upgraded:
+            logger.info(f"  {upgraded} files marked for re-download (below {upgrade_threshold}kbps)")
 
     consecutive_failures = 0
     failed_tracks = []
@@ -463,6 +561,58 @@ def sync_playlist(
     return stats
 
 
+def tag_playlist(
+    sp: spotipy.Spotify,
+    folder_path: str,
+    playlist_url: str,
+    dry_run: bool = False,
+) -> dict:
+    """Tag existing MP3 files in a playlist folder with Spotify metadata."""
+    stats = {"tagged": 0, "skipped": 0, "total": 0}
+
+    resolved = Path(os.path.expanduser(folder_path))
+    if not resolved.exists():
+        logger.warning(f"  Folder does not exist: {resolved}")
+        return stats
+
+    playlist_name = resolved.name
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Tagging: {playlist_name}")
+    logger.info(f"Folder:  {resolved}")
+
+    try:
+        tracks = get_playlist_tracks(sp, playlist_url)
+    except Exception as e:
+        logger.error(f"  Failed to fetch tracks: {e}")
+        return stats
+
+    stats["total"] = len(tracks)
+    existing = existing_files_normalized(resolved)
+
+    for i, track in enumerate(tracks, 1):
+        filename = build_track_filename(track["name"], track["artists"])
+        normalized = normalize_for_comparison(Path(filename).stem)
+
+        if normalized not in existing:
+            stats["skipped"] += 1
+            continue
+
+        actual_file = resolved / existing[normalized]
+        if dry_run:
+            logger.info(f"  [{i}/{len(tracks)}] [DRY RUN] Would tag: {actual_file.name}")
+            stats["tagged"] += 1
+            continue
+
+        if embed_metadata(actual_file, track):
+            logger.info(f"  [{i}/{len(tracks)}] Tagged: {actual_file.name}")
+            stats["tagged"] += 1
+        else:
+            stats["skipped"] += 1
+
+    logger.info(f"  Result: {stats['tagged']} tagged, {stats['skipped']} skipped")
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -483,9 +633,9 @@ def parse_args() -> argparse.Namespace:
         help="Folder name to use with --add (default: derived from playlist name)",
     )
     parser.add_argument(
-        "--download-only",
+        "--discover",
         action="store_true",
-        help="Skip discovery, only download from existing playlists.json",
+        help="Re-discover playlists from Spotify and update playlists.json before downloading",
     )
     parser.add_argument(
         "--discover-only",
@@ -507,6 +657,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum number of downloads per session",
+    )
+    parser.add_argument(
+        "--tag-only",
+        action="store_true",
+        help="Embed Spotify metadata (tags + album art) into existing MP3 files without downloading",
+    )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Re-download MP3s that are below 320kbps (deletes low-bitrate files so sync re-fetches them)",
+    )
+    parser.add_argument(
+        "--upgrade-threshold",
+        type=int,
+        default=256,
+        help="Bitrate threshold in kbps for --upgrade (files at or below this are re-downloaded, default: 256)",
     )
     parser.add_argument(
         "--cookies",
@@ -586,18 +752,10 @@ def main():
         add_playlist(sp, args.add, args.name)
         return
 
-    # Step 2: Discover playlists (skip if --download-only)
-    if args.download_only:
-        if not PLAYLISTS_JSON.exists():
-            logger.error("playlists.json not found. Run without --download-only first.")
-            sys.exit(1)
-        try:
-            merged = json.loads(PLAYLISTS_JSON.read_text())
-        except json.JSONDecodeError:
-            logger.error("Could not parse playlists.json")
-            sys.exit(1)
-        logger.info(f"Loaded {len(merged)} playlists from playlists.json (skipping discovery)")
-    else:
+    # Step 2: Discover playlists (only if --discover or --discover-only, or no playlists.json yet)
+    run_discovery = args.discover or args.discover_only or not PLAYLISTS_JSON.exists()
+
+    if run_discovery:
         logger.info("\nDiscovering playlists...")
         discovered = discover_playlists(sp)
         logger.info(f"Found {len(discovered)} playlists on profile")
@@ -610,6 +768,13 @@ def main():
         if args.discover_only:
             logger.info("\n--discover-only flag set. Exiting without downloading.")
             return
+    else:
+        try:
+            merged = json.loads(PLAYLISTS_JSON.read_text())
+        except json.JSONDecodeError:
+            logger.error("Could not parse playlists.json")
+            sys.exit(1)
+        logger.info(f"Loaded {len(merged)} playlists from playlists.json")
 
     # Step 3: Determine which playlists to sync
     if args.playlist:
@@ -620,6 +785,20 @@ def main():
         to_sync = matching
     else:
         to_sync = merged
+
+    # Handle --tag-only (no downloads, just embed metadata)
+    if args.tag_only:
+        logger.info("\nTagging existing files with Spotify metadata...")
+        total_tagged = 0
+        total_skipped = 0
+        for folder, url in to_sync.items():
+            stats = tag_playlist(sp, folder, url, dry_run=args.dry_run)
+            total_tagged += stats["tagged"]
+            total_skipped += stats["skipped"]
+        logger.info(f"\n{'='*60}")
+        logger.info(f"TAGGING COMPLETE: {total_tagged} tagged, {total_skipped} skipped")
+        logger.info(f"{'='*60}")
+        return
 
     # Step 4: Resolve cookies
     cookies_browser = resolve_cookies_browser(args.cookies_from_browser)
@@ -649,6 +828,8 @@ def main():
             dry_run=args.dry_run,
             max_downloads=args.max_downloads,
             download_count=download_count,
+            upgrade=args.upgrade,
+            upgrade_threshold=args.upgrade_threshold,
         )
 
         for key in total_stats:
