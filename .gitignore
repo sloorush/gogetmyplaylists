@@ -5,7 +5,18 @@
 !.gitignore
 !updateall.sh
 !playlists.json
+!sync.py
+!requirements.txt
+!README.md
+!CLAUDE.md
 
 # Explicitly ignore (even if above rules change)
+exports/
 .logs/
 *.sync.spotdl
+.env
+.spotify_cache
+cookies.txt
+__pycache__/
+.venv/
+.failed_tracks.json
